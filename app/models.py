@@ -113,6 +113,25 @@ class FailureImpact(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class FailureRevocation(Base):
+    """故障撤销：已登记故障经核实为误报时，凭故障编号 + 撤销原因 + 姓名登记。
+
+    原故障、已固定的影响清单、隔离与交接失效记录均保留不改写；
+    撤销不自动解除隔离，也不恢复交接或位置（仍须人工复核放行）。
+    每个故障仅可撤销一次（failure_id 唯一）；相同编号、原因与操作者的
+    重复撤销幂等返回首次结果，内容不同报冲突。
+    """
+
+    __tablename__ = "failure_revocations"
+
+    id = Column(Integer, primary_key=True)
+    failure_id = Column(Integer, ForeignKey("equipment_failures.id"),
+                        nullable=False, unique=True, index=True)  # 每个故障仅一条撤销
+    reason = Column(String(256), nullable=False)                  # 撤销原因
+    operator = Column(String(64), nullable=False)                 # 撤销人姓名
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class TempRangeAdjustment(Base):
     """温区调整：提交时刻生效；保存旧/新温区、理由、操作者、生效时间与复核结果。
 

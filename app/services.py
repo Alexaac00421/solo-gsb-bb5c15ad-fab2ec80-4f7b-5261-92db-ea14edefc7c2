@@ -18,11 +18,13 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
-                     QuarantineRecord, ReadingCorrection, Sample,
-                     TempRangeAdjustment, TemperatureReading)
+from .models import (AuditLog, EquipmentFailure, FailureImpact,
+                     FailureRevocation, Handover, QuarantineRecord,
+                     ReadingCorrection, Sample, TempRangeAdjustment,
+                     TemperatureReading)
 
 
 class DomainError(Exception):
@@ -449,7 +451,8 @@ def _lock_failure_tables(db: Session) -> None:
         return
     db.execute(text(
         "LOCK TABLE samples, handovers, temperature_readings, quarantine_records, "
-        "equipment_failures, failure_impacts, audit_logs IN EXCLUSIVE MODE"))
+        "equipment_failures, failure_impacts, failure_revocations, audit_logs "
+        "IN EXCLUSIVE MODE"))
 
 
 def register_failure(db: Session, code: str, location: str,
@@ -583,6 +586,86 @@ def register_failure(db: Session, code: str, location: str,
     return failure, True, impacts
 
 
+def _find_revocation(db: Session, code: str):
+    """按故障编号查出 (故障, 撤销记录)；未撤销时撤销记录为 None。"""
+    failure = db.scalar(select(EquipmentFailure).where(EquipmentFailure.code == code))
+    if failure is None:
+        return None, None
+    revocation = db.scalar(
+        select(FailureRevocation).where(FailureRevocation.failure_id == failure.id))
+    return failure, revocation
+
+
+def revoke_failure(db: Session, code: str, reason: str, operator: str
+                   ) -> tuple[EquipmentFailure, FailureRevocation, bool]:
+    """凭故障编号撤销已登记的设备故障（经核实为误报）。
+
+    返回 (故障, 撤销记录, 是否本次新建)。
+    - 相同故障编号 + 相同撤销原因 + 相同操作者的重复撤销：幂等返回首次结果，
+      不重复写审计、不变更任何状态；
+    - 该编号已撤销但撤销原因或操作者不同：ConflictError（409），不做任何变更；
+    - 故障编号不存在（404）、撤销原因为空、姓名空：DomainError 明确拒绝；
+    - 原故障、已固定的影响清单、隔离与交接失效记录全部保留不改写；
+      撤销不自动解除隔离，也不恢复交接或位置，仍须人工复核放行；
+    - 与故障登记共用表级锁（PG EXCLUSIVE，事务第一条语句）串行化，
+      SQLite 靠单写库锁 + busy_timeout；任何失败整体回滚，不留部分变更。
+    """
+    # ---- 1. 参数校验（失败不写任何数据）----
+    code = (code or "").strip()
+    reason = (reason or "").strip()
+    operator = (operator or "").strip()
+    if not code:
+        raise DomainError("故障编号不能为空")
+    if not reason:
+        raise DomainError("撤销原因不能为空")
+    if not operator:
+        raise DomainError("操作者姓名不能为空")
+
+    # ---- 2. 串行化：与故障登记同一把表锁（PG），再查重；SQLite 靠写库锁 ----
+    _lock_failure_tables(db)
+    failure, existing = _find_revocation(db, code)
+    if failure is None:
+        raise DomainError(f"故障编号 {code} 不存在，无法撤销", 404)
+    if existing is not None:
+        if existing.reason == reason and existing.operator == operator:
+            return failure, existing, False  # 幂等：返回首次撤销结果
+        raise ConflictError(
+            f"故障 {code} 已撤销（撤销人 {existing.operator}），本次撤销原因或操作者"
+            "与其不同，存在冲突；本次未做任何变更")
+
+    revocation = FailureRevocation(failure_id=failure.id, reason=reason,
+                                   operator=operator)
+    db.add(revocation)
+    try:
+        db.flush()  # 触发 failure_id 唯一约束；SQLite 下同时取得写库锁
+    except IntegrityError:
+        # 并发下该故障已被其他事务撤销：回滚后按幂等/冲突规则处理
+        db.rollback()
+        failure, existing = _find_revocation(db, code)
+        if failure is not None and existing is not None:
+            if existing.reason == reason and existing.operator == operator:
+                return failure, existing, False
+            raise ConflictError(
+                f"故障 {code} 已撤销（撤销人 {existing.operator}），本次撤销原因或操作者"
+                "与其不同，存在冲突；本次未做任何变更")
+        raise DomainError("故障撤销与其他提交并发冲突，本次未生效，请稍后重试")
+
+    # ---- 3. 留痕：对每个受影响样品追加 FAILURE_REVOKED 审计（只追加，不改写）----
+    impacts = db.scalars(
+        select(FailureImpact).where(FailureImpact.failure_id == failure.id)
+        .order_by(FailureImpact.id)).all()
+    for sid in sorted({imp.sample_id for imp in impacts}):
+        _audit(db, sid, "FAILURE_REVOKED", operator, {
+            "failure_id": failure.id, "failure_code": failure.code,
+            "revocation_id": revocation.id, "reason": reason,
+            "note": "故障经核实为误报予以撤销；隔离不自动解除、交接与位置不恢复，"
+                    "仍须人工复核放行"})
+
+    # ---- 4. 原子提交；任何失败整体回滚 ----
+    db.commit()
+    return failure, revocation, True
+
+
 # ---------------------------------------------------------------- 历史温控证据报告（只读）
 
 def _applicable_range(initial_min: float, initial_max: float,
@@ -635,6 +718,8 @@ def build_evidence_report(db: Session, sample_id: int,
       库位取确认时间不晚于读数的最后一次已确认交接（同刻取 ID 较大者）。
     - 另列「已固定」故障影响清单中与时间窗相交的故障及交集时段；
       窗内无读数也列故障，且任何情况下都不输出合规结论。
+    - 已撤销（误报）的相交故障照常列出并附撤销依据（撤销原因/撤销人），
+      但不再仅因该故障判为「不符合」；未撤销故障或最终更正值越界仍按原规则判定。
     调用方须提供一致性快照会话（PostgreSQL 下为 REPEATABLE READ 只读事务），
     使读数、更正链、温区调整、交接、故障影响清单来自同一数据视图。
     本函数不写入任何数据，不改变隔离、交接与历史审计。
@@ -720,6 +805,13 @@ def build_evidence_report(db: Session, sample_id: int,
             select(EquipmentFailure).where(EquipmentFailure.id.in_(failure_ids))
         ).all()
     } if failure_ids else {}
+    # 故障撤销记录（误报）：已撤销故障仍列出并附撤销依据，但不再仅因该故障判不符合
+    revocation_map = {
+        rev.failure_id: rev for rev in db.scalars(
+            select(FailureRevocation)
+            .where(FailureRevocation.failure_id.in_(failure_ids))
+        ).all()
+    } if failure_ids else {}
     failure_rows: list[dict] = []
     for imp in impacts:
         failure = failure_map.get(imp.failure_id)
@@ -732,9 +824,13 @@ def build_evidence_report(db: Session, sample_id: int,
         failure_rows.append({
             "failure": failure,
             "impact": imp,
+            "revocation": revocation_map.get(imp.failure_id),  # None 表示未撤销
             "intersect_start": intersect_start,
             "intersect_end": intersect_end,
         })
+    # 未撤销的相交故障才参与「不符合」判定；已撤销（误报）故障仅列示
+    active_failure_rows = [fr for fr in failure_rows if fr["revocation"] is None]
+    revoked_failure_rows = [fr for fr in failure_rows if fr["revocation"] is not None]
 
     # ---- 汇总结论：只列证据，永不判合规 ----
     final_bad = [row for row in rows if row["final_out_of_range"]]
@@ -745,19 +841,33 @@ def build_evidence_report(db: Session, sample_id: int,
         ids_text = "、".join(f"#{row['reading_id']}" for row in final_bad)
         reasons.append(f"窗内 {len(final_bad)} 条读数按最终更正值对照记录时生效温区判定越界"
                        f"（读数 {ids_text}）")
-    if failure_rows:
-        codes = "、".join(sorted({fr["failure"].code for fr in failure_rows}))
-        reasons.append(f"窗内与 {len(failure_rows)} 段已固定的设备故障影响时段相交"
+    if active_failure_rows:
+        codes = "、".join(sorted({fr["failure"].code for fr in active_failure_rows}))
+        reasons.append(f"窗内与 {len(active_failure_rows)} 段已固定的设备故障影响时段相交"
                        f"（故障编号：{codes}）")
+    if revoked_failure_rows:
+        seen: dict[int, dict] = {}
+        for fr in revoked_failure_rows:
+            seen.setdefault(fr["failure"].id, fr)
+        basis = "；".join(
+            f"故障 {fr['failure'].code} 经核实为误报，撤销依据：{fr['revocation'].reason}"
+            f"（撤销人 {fr['revocation'].operator}）" for fr in seen.values())
+        reasons.append(f"窗内与 {len(revoked_failure_rows)} 段已撤销的故障影响时段相交"
+                       f"（{basis}）；已撤销故障不再单独作为不符合依据，相关隔离与交接"
+                       "失效记录仍保留，不自动解除或恢复")
     if not rows:
         reasons.append("查询窗内无温度读数，不能证明全程受控")
-    if not final_bad and rows and not failure_rows:
-        reasons.append("窗内读数最终值均未越界且无相交故障，但证据报告仅列事实，不作合规判定")
+    if not final_bad and rows and not active_failure_rows:
+        if revoked_failure_rows:
+            reasons.append("窗内读数最终值均未越界，相交故障均已撤销（误报）；"
+                           "证据报告仅列事实，不作合规判定")
+        else:
+            reasons.append("窗内读数最终值均未越界且无相交故障，但证据报告仅列事实，不作合规判定")
     if original_only_bad:
         ids_text = "、".join(f"#{row['reading_id']}" for row in original_only_bad)
         reasons.append(f"另有 {len(original_only_bad)} 条读数仅原始判定越界、最终更正值未越界"
                        f"（读数 {ids_text}）；原始越界判定保留不改写")
-    verdict = "NON_COMPLIANT" if (final_bad or failure_rows) else "INCONCLUSIVE"
+    verdict = "NON_COMPLIANT" if (final_bad or active_failure_rows) else "INCONCLUSIVE"
 
     return {
         "sample": sample,
@@ -774,5 +884,9 @@ def build_evidence_report(db: Session, sample_id: int,
             "original_only_out_of_range": len(original_only_bad),
             "failure_segments": len(failure_rows),
             "failures": len({fr["failure"].id for fr in failure_rows}),
+            "active_failure_segments": len(active_failure_rows),
+            "active_failures": len({fr["failure"].id for fr in active_failure_rows}),
+            "revoked_failure_segments": len(revoked_failure_rows),
+            "revoked_failures": len({fr["failure"].id for fr in revoked_failure_rows}),
         },
     }

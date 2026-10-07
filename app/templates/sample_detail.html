@@ -50,11 +50,12 @@
   <h3>关联设备故障（隔离依据）</h3>
   <table>
     <thead>
-      <tr><th>故障编号</th><th>库位</th><th>故障时段（左闭右开）</th><th>本样品重叠时段</th><th>登记时状态</th><th>操作者</th></tr>
+      <tr><th>故障编号</th><th>库位</th><th>故障时段（左闭右开）</th><th>本样品重叠时段</th><th>登记时状态</th><th>撤销状态</th><th>操作者</th></tr>
     </thead>
     <tbody>
       {% for fid, imps in impacts_by_failure.items() %}
       {% set f = failure_map.get(fid) %}
+      {% set rev = revocation_map.get(fid) %}
       {% if f %}
       {% for imp in imps %}
       <tr>
@@ -66,6 +67,14 @@
           {% if imp.was_quarantined %}<span class="badge bad">已隔离·仅关联</span>
           {% else %}<span class="badge pending">未隔离·本次隔离</span>{% endif %}
         </td>
+        <td>
+          {% if rev %}
+            <span class="badge muted">已撤销（误报）</span>
+            <div class="hint">{{ rev.operator }}：{{ rev.reason }}</div>
+          {% else %}
+            <span class="badge pending">在效</span>
+          {% endif %}
+        </td>
         <td>{{ f.operator }}</td>
       </tr>
       {% endfor %}
@@ -73,7 +82,7 @@
       {% endfor %}
     </tbody>
   </table>
-  <p class="hint">受影响清单在故障登记时一次性固定；解除隔离仍须使用上方「注明理由的复核结论」流程。</p>
+  <p class="hint">受影响清单在故障登记时一次性固定；故障撤销（误报）不自动解除隔离、不恢复交接或位置，解除隔离仍须使用上方「注明理由的复核结论」流程。</p>
 </div>
 {% endif %}
 

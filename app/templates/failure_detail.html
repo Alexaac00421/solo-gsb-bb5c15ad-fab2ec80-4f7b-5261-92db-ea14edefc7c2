@@ -3,7 +3,11 @@
 {% block content %}
 <div class="card">
   <div class="card-head">
-    <h2>设备故障 {{ failure.code }}</h2>
+    <h2>
+      设备故障 {{ failure.code }}
+      {% if revocation %}<span class="badge muted">已撤销（误报）</span>
+      {% else %}<span class="badge pending">在效</span>{% endif %}
+    </h2>
     <a class="btn" href="/failures">返回故障列表</a>
   </div>
   <p class="meta">
@@ -13,6 +17,38 @@
     登记时间：{{ failure.created_at | dt }}
   </p>
 </div>
+
+{% if revocation %}
+<div class="card info">
+  <h3>撤销记录（经核实为误报）</h3>
+  <p class="meta">
+    撤销时间：<b>{{ revocation.created_at | dt }}</b> ｜
+    撤销人：<b>{{ revocation.operator }}</b><br>
+    撤销原因：<b>{{ revocation.reason }}</b>
+  </p>
+  <p class="hint">
+    原故障登记、已固定的影响清单、隔离与交接失效记录均留存不改写；撤销<b>不自动解除隔离</b>，
+    也不恢复交接或位置，仍须沿用样品详情页「注明理由的复核结论」人工复核放行。
+    历史温控证据报告仍列出本故障及以上撤销依据，但不再仅因本故障判为「不符合」。
+  </p>
+</div>
+{% else %}
+<div class="card">
+  <h3>撤销故障（经核实为误报时）</h3>
+  <form method="post" action="/failures/revoke" class="form inline-form">
+    <input type="hidden" name="code" value="{{ failure.code }}">
+    <label class="grow">撤销原因 *
+      <input name="reason" required placeholder="例如：复核确认为传感器误报，库温全程未实际越界">
+    </label>
+    <label>姓名 *<input name="operator" required placeholder="撤销操作人"></label>
+    <button type="submit" class="btn danger">撤销故障 {{ failure.code }}</button>
+  </form>
+  <p class="hint">
+    相同故障编号、撤销原因与姓名的重复撤销返回首次结果，内容不同报冲突。
+    撤销只追加撤销记录，不删除或改写任何既有记录，不自动解除隔离、不恢复交接或位置。
+  </p>
+</div>
+{% endif %}
 
 <div class="card">
   <h3>受影响样品清单（登记时一次性固定）</h3>

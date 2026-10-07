@@ -19,9 +19,10 @@ from sqlalchemy.orm import Session
 
 from . import services
 from .database import Base, SessionLocal, engine, get_db, get_report_db
-from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
-                     QuarantineRecord, ReadingCorrection, Sample,
-                     TempRangeAdjustment, TemperatureReading)
+from .models import (AuditLog, EquipmentFailure, FailureImpact,
+                     FailureRevocation, Handover, QuarantineRecord,
+                     ReadingCorrection, Sample, TempRangeAdjustment,
+                     TemperatureReading)
 from .services import DomainError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ EVENT_NAMES = {
     "QUARANTINE_RELEASED": "隔离解除",
     "FAULT_AFFECTED": "故障影响",
     "FAULT_LINKED": "故障关联（已隔离）",
+    "FAILURE_REVOKED": "故障撤销（误报）",
     "TEMP_RANGE_ADJUSTED": "温区调整",
 }
 
@@ -225,7 +227,9 @@ def failures(request: Request, db: Session = Depends(get_db)):
     counts = dict(db.execute(
         select(FailureImpact.failure_id, func.count())
         .group_by(FailureImpact.failure_id)).all())
-    return render(request, "failures.html", failures=items, counts=counts)
+    revocations = {r.failure_id: r for r in db.scalars(select(FailureRevocation)).all()}
+    return render(request, "failures.html", failures=items, counts=counts,
+                  revocations=revocations)
 
 
 @app.get("/failures/new", response_class=HTMLResponse)
@@ -249,9 +253,11 @@ def failure_detail(failure_id: int, request: Request, db: Session = Depends(get_
     invalidated = db.scalars(
         select(Handover).where(Handover.failure_id == failure_id)
         .order_by(Handover.id)).all()
+    revocation = db.scalar(
+        select(FailureRevocation).where(FailureRevocation.failure_id == failure_id))
     return render(request, "failure_detail.html", failure=failure, impacts=impacts,
                   sample_map=sample_map, quarantines=quarantines,
-                  invalidated=invalidated)
+                  invalidated=invalidated, revocation=revocation)
 
 
 @app.get("/samples/{sample_id}", response_class=HTMLResponse)
@@ -289,6 +295,9 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
     failure_ids = sorted({imp.failure_id for imp in impact_rows})
     failure_map = {f.id: f for f in db.scalars(
         select(EquipmentFailure).where(EquipmentFailure.id.in_(failure_ids))).all()} if failure_ids else {}
+    revocation_map = {r.failure_id: r for r in db.scalars(
+        select(FailureRevocation)
+        .where(FailureRevocation.failure_id.in_(failure_ids))).all()} if failure_ids else {}
     impacts_by_failure: dict[int, list] = {}
     for imp in impact_rows:
         impacts_by_failure.setdefault(imp.failure_id, []).append(imp)
@@ -301,13 +310,14 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
                   corrections_by_reading=corrections_by_reading, effective=effective,
                   quarantines=quarantines, audits=audits, pending=pending,
                   failure_map=failure_map, impacts_by_failure=impacts_by_failure,
+                  revocation_map=revocation_map,
                   adjustments=adjustments, event_names=EVENT_NAMES)
 
 
 # ---------------------------------------------------------------- 历史温控证据报告
 
 VERDICT_LABELS = {
-    "NON_COMPLIANT": "不符合（按最终值存在越界和/或与已固定故障时段相交）",
+    "NON_COMPLIANT": "不符合（按最终值存在越界和/或与未撤销的已固定故障时段相交）",
     "INCONCLUSIVE": "无法判定合规（证据不足，本报告任何情况下均不作合规结论）",
 }
 
@@ -367,18 +377,24 @@ def _evidence_csv(report: dict) -> str:
     else:
         writer.writerow(["窗内无温度读数（不判合规）"])
     writer.writerow([])
-    writer.writerow(["二、已固定故障影响清单中与查询窗相交的故障及交集时段"])
+    writer.writerow(["二、已固定故障影响清单中与查询窗相交的故障及交集时段"
+                     "（含已撤销故障及撤销依据；已撤销故障不单独作为不符合依据）"])
     writer.writerow(["故障ID", "故障编号", "库位", "故障开始[ (UTC)", "故障结束) (UTC)",
-                     "交集起[ (UTC)", "交集止) (UTC)", "登记时样品状态", "故障原因", "操作者"])
+                     "交集起[ (UTC)", "交集止) (UTC)", "登记时样品状态", "故障原因", "操作者",
+                     "撤销状态", "撤销时间(UTC)", "撤销人", "撤销原因"])
     if report["failure_rows"]:
         for fr in report["failure_rows"]:
-            f, imp = fr["failure"], fr["impact"]
+            f, imp, rev = fr["failure"], fr["impact"], fr["revocation"]
             writer.writerow([
                 f.id, f.code, f.location,
                 fmt_utc(f.start_time), fmt_utc(f.end_time),
                 fmt_utc(fr["intersect_start"]), fmt_utc(fr["intersect_end"]),
                 ("已隔离·仅关联" if imp.was_quarantined else "未隔离·本次隔离"),
                 f.reason, f.operator,
+                ("已撤销（误报）" if rev else "在效"),
+                fmt_utc(rev.created_at) if rev else "",
+                rev.operator if rev else "",
+                rev.reason if rev else "",
             ])
     else:
         writer.writerow(["无相交故障"])
@@ -556,6 +572,27 @@ def create_failure(code: str = Form(...), location: str = Form(...),
     return redirect(f"/failures/{failure.id}",
                     f"故障 {failure.code} 登记完成：无样品在该库位与故障时段重叠，已保存空影响清单",
                     "success")
+
+
+@app.post("/failures/revoke")
+def revoke_failure(code: str = Form(...), reason: str = Form(...),
+                   operator: str = Form(...), db: Session = Depends(get_db)):
+    try:
+        failure, revocation, created = services.revoke_failure(
+            db, code, reason, operator)
+    except DomainError as e:
+        return redirect("/failures", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, "/failures", "故障撤销")
+        raise
+    if not created:
+        return redirect(f"/failures/{failure.id}",
+                        f"故障 {failure.code} 此前已按相同内容撤销（撤销人 {revocation.operator}），"
+                        "本次返回首次撤销结果，未重复变更")
+    return redirect(f"/failures/{failure.id}",
+                    f"故障 {failure.code} 已撤销（误报）：原故障登记、影响清单、隔离与交接失效"
+                    "记录全部留存；撤销不自动解除隔离，也不恢复交接或位置，仍须人工复核放行")
 
 
 # ---------------------------------------------------------------- 导出
