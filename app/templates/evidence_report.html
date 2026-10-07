@@ -26,8 +26,10 @@
   <p class="hint">
     窗内读数 {{ report.counts.readings }} 条 ｜ 最终值越界 {{ report.counts.final_out_of_range }} 条 ｜
     仅原始判定越界 {{ report.counts.original_only_out_of_range }} 条 ｜
-    相交故障 {{ report.counts.failures }} 个（{{ report.counts.failure_segments }} 段）。
+    相交故障：未撤销 {{ report.counts.active_failures }} 个（{{ report.counts.active_failure_segments }} 段）、
+    已撤销（误报）{{ report.counts.cancelled_failures }} 个（{{ report.counts.cancelled_failure_segments }} 段）。
     本报告仅列证据事实，<b>任何情况下均不构成合规证明</b>；窗内无读数也不得判为合规。
+    已撤销故障列出但不判不符合；未撤销故障或最终更正值越界仍按原规则判定。
   </p>
 </div>
 
@@ -83,20 +85,22 @@
   </p>
 </div>
 
-<div class="card {{ 'warn' if report.failure_rows else '' }}">
-  <h3>二、相交的已固定设备故障（{{ report.counts.failure_segments }} 段 / {{ report.counts.failures }} 个故障）</h3>
+<div class="card {{ 'warn' if report.counts.active_failure_segments else '' }}">
+  <h3>二、相交的已固定设备故障（{{ report.counts.failure_segments }} 段 / {{ report.counts.failures }} 个故障；
+    未撤销 {{ report.counts.active_failures }} 个 / 已撤销（误报）{{ report.counts.cancelled_failures }} 个）</h3>
   <table>
     <thead>
       <tr>
         <th>故障编号</th><th>库位</th><th>故障时段 (UTC)</th><th>与查询窗交集时段 (UTC)</th>
-        <th>登记时状态</th><th>故障原因</th><th>操作者</th>
+        <th>登记时状态</th><th>撤销状态 / 依据</th><th>故障原因</th><th>操作者</th>
       </tr>
     </thead>
     <tbody>
       {% for fr in report.failure_rows %}
       {% set f = fr.failure %}
       {% set imp = fr.impact %}
-      <tr class="row-bad">
+      {% set c = fr.cancellation %}
+      <tr class="{{ 'row-bad' if not fr.cancelled else '' }}">
         <td><a href="/failures/{{ f.id }}"><b>{{ f.code }}</b></a></td>
         <td>{{ f.location }}</td>
         <td>{{ f.start_time | utc }} ~ {{ f.end_time | utc }}</td>
@@ -105,17 +109,31 @@
           {% if imp.was_quarantined %}<span class="badge bad">已隔离·仅关联</span>
           {% else %}<span class="badge pending">未隔离·本次隔离</span>{% endif %}
         </td>
+        <td>
+          {% if fr.cancelled %}
+            <span class="badge muted">已撤销（误报）</span>
+            <div class="hint">
+              {{ c.created_at | utc }} UTC ｜ {{ c.operator }}<br>
+              撤销原因：{{ c.reason }}
+            </div>
+          {% else %}
+            <span class="badge bad">未撤销</span>
+          {% endif %}
+        </td>
         <td>{{ f.reason }}</td>
         <td>{{ f.operator }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="7" class="empty">已固定影响清单中无与查询窗相交的故障</td></tr>
+      <tr><td colspan="8" class="empty">已固定影响清单中无与查询窗相交的故障</td></tr>
       {% endfor %}
     </tbody>
   </table>
   <p class="hint">
     故障影响清单在故障登记时一次性固定（库位时段 × 故障时段，左闭右开），不随后续位置/状态变化重算；
     与查询窗的交集为 <code>max(窗起, 重叠起) ≤ t &lt; min(窗止, 重叠止)</code>。
+    <b>已撤销（误报）故障仍列出并附撤销依据，但不再仅因该故障判为「不符合」</b>；
+    其他未撤销故障相交或读数最终更正值越界仍判「不符合」。撤销不自动解除隔离，
+    样品是否仍在隔离以隔离记录与人工复核放行结论为准。
   </p>
 </div>
 
@@ -128,7 +146,7 @@
   </form>
   <p class="hint">
     起始须早于结束，结束不晚于当前时间；页面时间一律按 UTC 解释。报告为生成时刻的一致性只读快照，
-    生成期间并发的读数更正、温区调整或故障登记不会改变本报告内容，也不改变隔离、交接与历史审计。
+    生成期间并发的读数更正、温区调整、故障登记或故障撤销不会改变本报告内容，也不改变隔离、交接与历史审计。
   </p>
 </div>
 {% endblock %}

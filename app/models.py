@@ -96,6 +96,24 @@ class EquipmentFailure(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class FailureCancellation(Base):
+    """故障撤销（误报核实后由操作员撤销）：每故障至多一条。
+
+    仅记录撤销本身（撤销原因、操作者、时间）；原故障登记、一次性固定的
+    影响样品及时段、隔离与交接失效记录一律留存，不删除、不改写。
+    撤销不自动解除隔离、不恢复交接或位置，仍须人工复核放行。
+    """
+
+    __tablename__ = "failure_cancellations"
+
+    id = Column(Integer, primary_key=True)
+    failure_id = Column(Integer, ForeignKey("equipment_failures.id"),
+                        unique=True, nullable=False, index=True)
+    reason = Column(String(256), nullable=False)                     # 撤销原因
+    operator = Column(String(64), nullable=False)                    # 撤销操作者
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class FailureImpact(Base):
     """故障影响清单：登记时固定。同一样品与故障时段有多段位置重叠时逐段各存一行。"""
 

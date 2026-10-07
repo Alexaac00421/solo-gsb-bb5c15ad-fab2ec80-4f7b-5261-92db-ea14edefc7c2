@@ -10,7 +10,7 @@
     <thead>
       <tr>
         <th>故障编号</th><th>库位</th><th>开始（含）</th><th>结束（不含）</th>
-        <th>原因</th><th>操作者</th><th>受影响样品</th><th>登记时间</th><th>操作</th>
+        <th>原因</th><th>操作者</th><th>受影响样品</th><th>状态</th><th>登记时间</th><th>操作</th>
       </tr>
     </thead>
     <tbody>
@@ -23,13 +23,26 @@
         <td>{{ f.reason }}</td>
         <td>{{ f.operator }}</td>
         <td>{{ counts.get(f.id, 0) }}</td>
+        <td>
+          {% if cancellations.get(f.id) %}
+            <span class="badge muted">已撤销（误报）</span>
+            <div class="hint">{{ cancellations.get(f.id).operator }}：{{ cancellations.get(f.id).reason }}</div>
+          {% else %}
+            <span class="badge pending">已登记</span>
+          {% endif %}
+        </td>
         <td>{{ f.created_at | dt }}</td>
-        <td><a href="/failures/{{ f.id }}">影响清单 / 隔离依据</a></td>
+        <td><a href="/failures/{{ f.id }}">详情 / 影响清单 / 撤销记录</a></td>
       </tr>
       {% else %}
-      <tr><td colspan="9" class="empty">暂无故障登记，<a href="/failures/new">立即登记</a></td></tr>
+      <tr><td colspan="10" class="empty">暂无故障登记，<a href="/failures/new">立即登记</a></td></tr>
       {% endfor %}
     </tbody>
   </table>
+  <p class="hint">
+    经核实为误报的故障可在故障详情页凭故障编号、撤销原因和操作者姓名撤销；
+    撤销只追加记录，原故障、固定影响清单、隔离与失效交接均留存不改写，
+    且不自动解除隔离、不恢复交接或位置（仍须人工复核放行）。
+  </p>
 </div>
 {% endblock %}

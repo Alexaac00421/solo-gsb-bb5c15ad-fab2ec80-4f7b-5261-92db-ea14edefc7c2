@@ -1,9 +1,12 @@
 {% extends "base.html" %}
 {% block title %}故障 {{ failure.code }}{% endblock %}
 {% block content %}
-<div class="card">
+<div class="card {{ 'info' if cancellation else '' }}">
   <div class="card-head">
-    <h2>设备故障 {{ failure.code }}</h2>
+    <h2>
+      设备故障 {{ failure.code }}
+      {% if cancellation %}<span class="badge muted">已撤销（误报）</span>{% endif %}
+    </h2>
     <a class="btn" href="/failures">返回故障列表</a>
   </div>
   <p class="meta">
@@ -12,10 +15,37 @@
     原因：<b>{{ failure.reason }}</b> ｜ 操作者：<b>{{ failure.operator }}</b> ｜
     登记时间：{{ failure.created_at | dt }}
   </p>
+  {% if cancellation %}
+  <div class="flash success" style="margin-top:12px">
+    <b>撤销记录（故障经核实为误报）</b><br>
+    撤销时间：{{ cancellation.created_at | dt }} ｜
+    撤销操作者：<b>{{ cancellation.operator }}</b> ｜
+    撤销原因：<b>{{ cancellation.reason }}</b><br>
+    <span class="hint">
+      原故障登记、登记时固定的影响样品及时段、隔离记录与失效交接记录均<b>留存不改写</b>；
+      本次撤销<b>不自动解除隔离</b>、<b>不恢复交接或位置</b>，相关样品仍须到样品详情页
+      走「注明理由的复核结论」人工复核放行。
+    </span>
+  </div>
+  {% else %}
+  <form method="post" action="/failures/{{ failure.id }}/cancel" class="form inline-form" style="margin-top:12px">
+    <input type="hidden" name="code" value="{{ failure.code }}">
+    <label class="grow">撤销原因 *（经核实为误报的依据）
+      <input name="reason" required placeholder="例如：现场复核为温度探头误报，设备运行正常">
+    </label>
+    <label>操作者姓名 *<input name="operator" required></label>
+    <button type="submit" class="btn danger">核实为误报，撤销该故障</button>
+  </form>
+  <p class="hint">
+    撤销只新增撤销记录：原故障、固定影响样品及时段、隔离与交接失效记录一律留存，不删除、不改写；
+    撤销不自动解除隔离，也不恢复交接或位置，仍须人工复核放行。
+    相同故障编号、撤销原因与操作者重复提交返回首次结果；内容不同将提示冲突。
+  </p>
+  {% endif %}
 </div>
 
 <div class="card">
-  <h3>受影响样品清单（登记时一次性固定）</h3>
+  <h3>受影响样品清单（登记时一次性固定，撤销后仍留存不改写）</h3>
   <table>
     <thead>
       <tr>
@@ -51,7 +81,7 @@
 </div>
 
 <div class="card">
-  <h3>隔离依据</h3>
+  <h3>隔离依据（撤销故障不删除、不改写这些记录）</h3>
   <table>
     <thead>
       <tr><th>隔离记录</th><th>样品</th><th>原因</th><th>状态</th><th>隔离时间</th><th>解除（复核）</th></tr>
@@ -70,9 +100,9 @@
         <td>{{ q.quarantined_at | dt }}</td>
         <td>
           {% if q.status == 'RELEASED' %}
-            {{ q.released_at | dt }} ｜ {{ q.released_by }}：{{ q.release_reason }}
+            {{ q.released_at | dt }} ｜ {{ q.released_by }}：{{ q.released_reason }}
           {% else %}
-            <span class="hint">到样品详情页走「注明理由的复核结论」流程解除</span>
+            <span class="hint">到样品详情页走「注明理由的复核结论」流程解除{% if cancellation %}（故障已撤销也不例外）{% endif %}</span>
           {% endif %}
         </td>
       </tr>
@@ -81,11 +111,11 @@
       {% endfor %}
     </tbody>
   </table>
-  <p class="hint">解除隔离不提供快捷入口，仍须在样品详情页填写复核人、复核结论并按最新状态版本提交。</p>
+  <p class="hint">解除隔离不提供快捷入口，仍须在样品详情页填写复核人、复核结论并按最新状态版本提交；撤销故障不会自动解除隔离。</p>
 </div>
 
 <div class="card">
-  <h3>失效的待确认交接</h3>
+  <h3>失效的待确认交接（撤销故障不恢复交接或位置）</h3>
   <table>
     <thead>
       <tr><th>交接</th><th>样品</th><th>交出人</th><th>接收人</th><th>目的地</th><th>失效时间</th></tr>

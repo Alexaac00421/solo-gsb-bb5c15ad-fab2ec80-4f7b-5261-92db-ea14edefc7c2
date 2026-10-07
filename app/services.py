@@ -18,11 +18,13 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
-                     QuarantineRecord, ReadingCorrection, Sample,
-                     TempRangeAdjustment, TemperatureReading)
+from .models import (AuditLog, EquipmentFailure, FailureCancellation,
+                     FailureImpact, Handover, QuarantineRecord,
+                     ReadingCorrection, Sample, TempRangeAdjustment,
+                     TemperatureReading)
 
 
 class DomainError(Exception):
@@ -449,7 +451,8 @@ def _lock_failure_tables(db: Session) -> None:
         return
     db.execute(text(
         "LOCK TABLE samples, handovers, temperature_readings, quarantine_records, "
-        "equipment_failures, failure_impacts, audit_logs IN EXCLUSIVE MODE"))
+        "equipment_failures, failure_impacts, failure_cancellations, audit_logs "
+        "IN EXCLUSIVE MODE"))
 
 
 def register_failure(db: Session, code: str, location: str,
@@ -583,6 +586,86 @@ def register_failure(db: Session, code: str, location: str,
     return failure, True, impacts
 
 
+# ---------------------------------------------------------------- 设备故障撤销（误报核实）
+
+def cancel_failure(db: Session, code: str, reason: str, operator: str
+                   ) -> tuple[EquipmentFailure, FailureCancellation, bool]:
+    """撤销经核实为误报的已登记设备故障。
+
+    返回 (故障, 撤销记录, 是否首次撤销)。
+
+    - 必填：故障编号、撤销原因、撤销操作者姓名；编号不存在报 404。
+    - 原故障、登记时固定的影响样品及时段（failure_impacts）、隔离记录与
+      失效交接一律留存，不删除、不改写任何既有行；仅新增一条撤销记录。
+    - 撤销不改变样品隔离状态/版本，不恢复任何交接或位置：仍须人工复核放行。
+    - 幂等与冲突：同一故障重复撤销且原因、操作者完全一致时返回首次结果
+      （不重复写撤销记录/审计）；原因或操作者不同报 409 冲突。
+    - 并发：与故障登记相同的串行化策略（PG 先取 EXCLUSIVE 表锁，再查重；
+      SQLite 靠单写库锁 + 唯一约束兜底），任何失败整体回滚，不留部分变更。
+    """
+    # ---- 1. 参数校验（失败不写任何数据）----
+    code = (code or "").strip()
+    reason = (reason or "").strip()
+    operator = (operator or "").strip()
+    missing = [name for name, val in (("故障编号", code), ("撤销原因", reason),
+                                      ("操作者", operator)) if not val]
+    if missing:
+        raise DomainError("必填字段缺失：" + "、".join(missing))
+
+    # ---- 2. 串行化：先锁表（PG），再查重；与登记/录温/交接确认等互斥 ----
+    _lock_failure_tables(db)
+    failure = db.scalar(select(EquipmentFailure).where(EquipmentFailure.code == code))
+    if failure is None:
+        raise DomainError(f"故障编号 {code} 不存在，无法撤销", 404)
+    existing = db.scalar(
+        select(FailureCancellation).where(FailureCancellation.failure_id == failure.id))
+    if existing is not None:
+        if existing.reason == reason and existing.operator == operator:
+            return failure, existing, False  # 幂等：返回首次撤销结果
+        raise ConflictError(
+            f"故障 {code} 已由 {existing.operator} 撤销，本次提交的撤销原因或操作者不同，"
+            "存在冲突；原撤销记录不得改写，如确需变更请走线下核对流程")
+
+    cancellation = FailureCancellation(failure_id=failure.id, reason=reason,
+                                       operator=operator)
+    db.add(cancellation)
+    try:
+        db.flush()  # 触发每故障唯一约束；SQLite 下同时取得写库锁
+    except IntegrityError:
+        # 并发下另一事务可能已先行撤销：回滚后按幂等/冲突规则判定
+        db.rollback()
+        _lock_failure_tables(db)
+        failure = db.scalar(select(EquipmentFailure).where(EquipmentFailure.code == code))
+        if failure is None:
+            raise DomainError(f"故障编号 {code} 不存在，无法撤销", 404)
+        existing = db.scalar(
+            select(FailureCancellation).where(FailureCancellation.failure_id == failure.id))
+        if existing is None:
+            raise DomainError("故障撤销与其他提交并发冲突，请稍后重试")
+        if existing.reason == reason and existing.operator == operator:
+            return failure, existing, False
+        raise ConflictError(
+            f"故障 {code} 已由 {existing.operator} 撤销，本次提交的撤销原因或操作者不同，"
+            "存在冲突；原撤销记录不得改写，如确需变更请走线下核对流程")
+
+    # ---- 3. 只追加留痕：逐受影响样品写撤销审计；不动隔离/交接/位置/版本 ----
+    now = _now()
+    impacts = db.scalars(
+        select(FailureImpact).where(FailureImpact.failure_id == failure.id)
+        .order_by(FailureImpact.id)).all()
+    affected_ids = sorted({imp.sample_id for imp in impacts})
+    for sid in affected_ids:
+        _audit(db, sid, "FAULT_CANCELLED", operator, {
+            "failure_id": failure.id, "failure_code": failure.code,
+            "cancellation_id": cancellation.id, "cancel_reason": reason,
+            "cancelled_at": now.isoformat(),
+            "note": "故障经核实为误报予以撤销；原故障、影响清单、隔离与失效交接记录留存不改写；"
+                    "撤销不自动解除隔离、不恢复交接或位置，仍须人工复核放行"})
+
+    db.commit()
+    return failure, cancellation, True
+
+
 # ---------------------------------------------------------------- 历史温控证据报告（只读）
 
 def _applicable_range(initial_min: float, initial_max: float,
@@ -635,6 +718,8 @@ def build_evidence_report(db: Session, sample_id: int,
       库位取确认时间不晚于读数的最后一次已确认交接（同刻取 ID 较大者）。
     - 另列「已固定」故障影响清单中与时间窗相交的故障及交集时段；
       窗内无读数也列故障，且任何情况下都不输出合规结论。
+      已撤销（核实为误报）的故障仍列出并附撤销依据，但不再仅因其相交而
+      判为「不符合」；其他未撤销故障或最终更正值越界仍按原规则判定。
     调用方须提供一致性快照会话（PostgreSQL 下为 REPEATABLE READ 只读事务），
     使读数、更正链、温区调整、交接、故障影响清单来自同一数据视图。
     本函数不写入任何数据，不改变隔离、交接与历史审计。
@@ -720,6 +805,13 @@ def build_evidence_report(db: Session, sample_id: int,
             select(EquipmentFailure).where(EquipmentFailure.id.in_(failure_ids))
         ).all()
     } if failure_ids else {}
+    # 故障撤销记录：已撤销（误报）故障仍须在报告中列出并给出撤销依据，
+    # 但不再仅因其相交而判为「不符合」。
+    cancellation_map = {
+        c.failure_id: c for c in db.scalars(
+            select(FailureCancellation).where(FailureCancellation.failure_id.in_(failure_ids))
+        ).all()
+    } if failure_ids else {}
     failure_rows: list[dict] = []
     for imp in impacts:
         failure = failure_map.get(imp.failure_id)
@@ -729,35 +821,49 @@ def build_evidence_report(db: Session, sample_id: int,
         intersect_end = min(end, _as_utc(imp.overlap_end))
         if intersect_start >= intersect_end:
             continue  # 左闭右开：严格小于才算相交
+        cancellation = cancellation_map.get(imp.failure_id)
         failure_rows.append({
             "failure": failure,
             "impact": imp,
             "intersect_start": intersect_start,
             "intersect_end": intersect_end,
+            "cancelled": cancellation is not None,
+            "cancellation": cancellation,
         })
 
     # ---- 汇总结论：只列证据，永不判合规 ----
     final_bad = [row for row in rows if row["final_out_of_range"]]
     original_only_bad = [row for row in rows
                          if row["original_out_of_range"] and not row["final_out_of_range"]]
+    active_failure_rows = [fr for fr in failure_rows if not fr["cancelled"]]
+    cancelled_failure_rows = [fr for fr in failure_rows if fr["cancelled"]]
     reasons: list[str] = []
     if final_bad:
         ids_text = "、".join(f"#{row['reading_id']}" for row in final_bad)
         reasons.append(f"窗内 {len(final_bad)} 条读数按最终更正值对照记录时生效温区判定越界"
                        f"（读数 {ids_text}）")
-    if failure_rows:
-        codes = "、".join(sorted({fr["failure"].code for fr in failure_rows}))
-        reasons.append(f"窗内与 {len(failure_rows)} 段已固定的设备故障影响时段相交"
+    if active_failure_rows:
+        codes = "、".join(sorted({fr["failure"].code for fr in active_failure_rows}))
+        reasons.append(f"窗内与 {len(active_failure_rows)} 段已固定的设备故障影响时段相交"
                        f"（故障编号：{codes}）")
+    if cancelled_failure_rows:
+        codes = "、".join(sorted({fr["failure"].code for fr in cancelled_failure_rows}))
+        reasons.append(
+            f"窗内另有 {len(cancelled_failure_rows)} 段相交故障已被撤销（核实为误报，"
+            f"故障编号：{codes}），报告列出该故障及撤销依据，但不再仅因该故障判为不符合；"
+            "撤销不自动解除隔离，样品实际隔离状态以隔离记录与人工复核放行结论为准")
     if not rows:
         reasons.append("查询窗内无温度读数，不能证明全程受控")
-    if not final_bad and rows and not failure_rows:
+    if (not final_bad and rows and not active_failure_rows
+            and not cancelled_failure_rows):
         reasons.append("窗内读数最终值均未越界且无相交故障，但证据报告仅列事实，不作合规判定")
     if original_only_bad:
         ids_text = "、".join(f"#{row['reading_id']}" for row in original_only_bad)
         reasons.append(f"另有 {len(original_only_bad)} 条读数仅原始判定越界、最终更正值未越界"
                        f"（读数 {ids_text}）；原始越界判定保留不改写")
-    verdict = "NON_COMPLIANT" if (final_bad or failure_rows) else "INCONCLUSIVE"
+    # 已撤销（误报）故障不再单独导致「不符合」；未撤销故障或最终更正值越界仍按原规则判定
+    verdict = ("NON_COMPLIANT" if (final_bad or active_failure_rows)
+               else "INCONCLUSIVE")
 
     return {
         "sample": sample,
@@ -774,5 +880,9 @@ def build_evidence_report(db: Session, sample_id: int,
             "original_only_out_of_range": len(original_only_bad),
             "failure_segments": len(failure_rows),
             "failures": len({fr["failure"].id for fr in failure_rows}),
+            "active_failure_segments": len(active_failure_rows),
+            "active_failures": len({fr["failure"].id for fr in active_failure_rows}),
+            "cancelled_failure_segments": len(cancelled_failure_rows),
+            "cancelled_failures": len({fr["failure"].id for fr in cancelled_failure_rows}),
         },
     }

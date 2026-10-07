@@ -19,9 +19,10 @@ from sqlalchemy.orm import Session
 
 from . import services
 from .database import Base, SessionLocal, engine, get_db, get_report_db
-from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
-                     QuarantineRecord, ReadingCorrection, Sample,
-                     TempRangeAdjustment, TemperatureReading)
+from .models import (AuditLog, EquipmentFailure, FailureCancellation,
+                     FailureImpact, Handover, QuarantineRecord,
+                     ReadingCorrection, Sample, TempRangeAdjustment,
+                     TemperatureReading)
 from .services import DomainError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ EVENT_NAMES = {
     "QUARANTINE_RELEASED": "隔离解除",
     "FAULT_AFFECTED": "故障影响",
     "FAULT_LINKED": "故障关联（已隔离）",
+    "FAULT_CANCELLED": "故障撤销（误报）",
     "TEMP_RANGE_ADJUSTED": "温区调整",
 }
 
@@ -225,7 +227,10 @@ def failures(request: Request, db: Session = Depends(get_db)):
     counts = dict(db.execute(
         select(FailureImpact.failure_id, func.count())
         .group_by(FailureImpact.failure_id)).all())
-    return render(request, "failures.html", failures=items, counts=counts)
+    cancellations = {c.failure_id: c for c in db.scalars(
+        select(FailureCancellation)).all()}
+    return render(request, "failures.html", failures=items, counts=counts,
+                  cancellations=cancellations)
 
 
 @app.get("/failures/new", response_class=HTMLResponse)
@@ -249,9 +254,11 @@ def failure_detail(failure_id: int, request: Request, db: Session = Depends(get_
     invalidated = db.scalars(
         select(Handover).where(Handover.failure_id == failure_id)
         .order_by(Handover.id)).all()
+    cancellation = db.scalar(
+        select(FailureCancellation).where(FailureCancellation.failure_id == failure_id))
     return render(request, "failure_detail.html", failure=failure, impacts=impacts,
                   sample_map=sample_map, quarantines=quarantines,
-                  invalidated=invalidated)
+                  invalidated=invalidated, cancellation=cancellation)
 
 
 @app.get("/samples/{sample_id}", response_class=HTMLResponse)
@@ -289,6 +296,8 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
     failure_ids = sorted({imp.failure_id for imp in impact_rows})
     failure_map = {f.id: f for f in db.scalars(
         select(EquipmentFailure).where(EquipmentFailure.id.in_(failure_ids))).all()} if failure_ids else {}
+    cancellation_map = {c.failure_id: c for c in db.scalars(
+        select(FailureCancellation).where(FailureCancellation.failure_id.in_(failure_ids))).all()} if failure_ids else {}
     impacts_by_failure: dict[int, list] = {}
     for imp in impact_rows:
         impacts_by_failure.setdefault(imp.failure_id, []).append(imp)
@@ -300,14 +309,15 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
                   sample=sample, handovers=handovers, readings=readings,
                   corrections_by_reading=corrections_by_reading, effective=effective,
                   quarantines=quarantines, audits=audits, pending=pending,
-                  failure_map=failure_map, impacts_by_failure=impacts_by_failure,
+                  failure_map=failure_map, cancellation_map=cancellation_map,
+                  impacts_by_failure=impacts_by_failure,
                   adjustments=adjustments, event_names=EVENT_NAMES)
 
 
 # ---------------------------------------------------------------- 历史温控证据报告
 
 VERDICT_LABELS = {
-    "NON_COMPLIANT": "不符合（按最终值存在越界和/或与已固定故障时段相交）",
+    "NON_COMPLIANT": "不符合（按最终值存在越界和/或与未撤销的已固定故障时段相交）",
     "INCONCLUSIVE": "无法判定合规（证据不足，本报告任何情况下均不作合规结论）",
 }
 
@@ -367,17 +377,25 @@ def _evidence_csv(report: dict) -> str:
     else:
         writer.writerow(["窗内无温度读数（不判合规）"])
     writer.writerow([])
-    writer.writerow(["二、已固定故障影响清单中与查询窗相交的故障及交集时段"])
+    writer.writerow(["二、已固定故障影响清单中与查询窗相交的故障及交集时段"
+                     "（已撤销=误报：列出但不再仅因该故障判为不符合）"])
     writer.writerow(["故障ID", "故障编号", "库位", "故障开始[ (UTC)", "故障结束) (UTC)",
-                     "交集起[ (UTC)", "交集止) (UTC)", "登记时样品状态", "故障原因", "操作者"])
+                     "交集起[ (UTC)", "交集止) (UTC)", "登记时样品状态",
+                     "是否已撤销", "撤销时间(UTC)", "撤销原因", "撤销操作者",
+                     "故障原因", "故障登记操作者"])
     if report["failure_rows"]:
         for fr in report["failure_rows"]:
             f, imp = fr["failure"], fr["impact"]
+            c = fr["cancellation"]
             writer.writerow([
                 f.id, f.code, f.location,
                 fmt_utc(f.start_time), fmt_utc(f.end_time),
                 fmt_utc(fr["intersect_start"]), fmt_utc(fr["intersect_end"]),
                 ("已隔离·仅关联" if imp.was_quarantined else "未隔离·本次隔离"),
+                "是（误报已撤销）" if fr["cancelled"] else "否",
+                fmt_utc(c.created_at) if c else "",
+                c.reason if c else "",
+                c.operator if c else "",
                 f.reason, f.operator,
             ])
     else:
@@ -556,6 +574,34 @@ def create_failure(code: str = Form(...), location: str = Form(...),
     return redirect(f"/failures/{failure.id}",
                     f"故障 {failure.code} 登记完成：无样品在该库位与故障时段重叠，已保存空影响清单",
                     "success")
+
+
+@app.post("/failures/{failure_id}/cancel")
+def cancel_failure(failure_id: int, code: str = Form(...),
+                   reason: str = Form(...), operator: str = Form(...),
+                   db: Session = Depends(get_db)):
+    failure = db.get(EquipmentFailure, failure_id)
+    detail_url = f"/failures/{failure_id}" if failure else "/failures"
+    try:
+        # 路径 ID 与表单编号必须指向同一故障，防止页面过期后误撤销
+        if failure is not None and (code or "").strip() != failure.code:
+            raise DomainError("提交的故障编号与页面故障不一致，已拒绝本次撤销")
+        failure, cancellation, created = services.cancel_failure(
+            db, code, reason, operator)
+    except DomainError as e:
+        return redirect(detail_url, e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, detail_url, "故障撤销")
+        raise
+    if not created:
+        return redirect(f"/failures/{failure.id}",
+                        f"故障 {failure.code} 的撤销已存在（{cancellation.operator}："
+                        f"{cancellation.reason}），已返回首次撤销结果，记录未变更")
+    return redirect(f"/failures/{failure.id}",
+                    f"故障 {failure.code} 已标记为误报撤销；原故障、固定影响清单、隔离与"
+                    "失效交接记录均留存。撤销不自动解除隔离、不恢复交接或位置，"
+                    "相关样品仍须在样品详情页走人工复核放行")
 
 
 # ---------------------------------------------------------------- 导出
